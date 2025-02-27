@@ -10,7 +10,7 @@ public class DatabricksCollibraValidation {
     static String validationTableName = "ASSET.properties";
     static int totalRecordsWishToValidate = 2000;
 
-    public static void main(String args[]) {
+    public static void main(String[] args) {
         //Read the global properties
         Properties globalProp = ReusableCommonMethods.readGlobalProperty();
         //If the global properties are not read, fail
@@ -43,7 +43,7 @@ public class DatabricksCollibraValidation {
         //Perform the comparison
         boolean overallValidation =
                 ReusableCommonMethods.performComparisonBetweenDBAndAPI
-                        (globalProp, tableProp, accessToken, totalRecordsWishToValidate, dataFromDatabricks);
+                        (globalProp, tableProp, accessToken, totalRecordsWishToValidate, dataFromDatabricks, validationTableName);
         if (!overallValidation) {
             System.out.println("Overall validation failed, please check logs for more details");
             System.exit(0);

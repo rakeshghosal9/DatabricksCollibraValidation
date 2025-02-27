@@ -7,14 +7,16 @@ import io.restassured.http.ContentType;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import io.restassured.specification.ResponseSpecification;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 
-import java.io.File;
-import java.io.FileInputStream;
+import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.sql.*;
-import java.util.HashMap;
-import java.util.Properties;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 
 import static io.restassured.RestAssured.given;
 
@@ -101,8 +103,7 @@ public class ReusableCommonMethods {
             Connection connection = DriverManager.getConnection(jdbcURL, connectionProperties);
             if (connection != null) {
                 Statement statement = connection.createStatement();
-                ResultSet resultSet = statement.executeQuery(sqlQuery);
-                return resultSet;
+                return statement.executeQuery(sqlQuery);
             } else {
                 return null;
             }
@@ -181,11 +182,11 @@ public class ReusableCommonMethods {
 
     public static boolean performComparisonBetweenDBAndAPI
             (Properties globalProp, Properties tableProp, String accessToken, int expectedTotalRecordsToValidate,
-             HashMap<String, HashMap<String, String>> dataFromDatabricks) {
+             HashMap<String, HashMap<String, String>> dataFromDatabricks, String validationTableName) {
         try {
-            String endPoint = null;
-            String mappingFileName = null;
-            String primaryKeyInJSONResponse = null;
+            String endPoint;
+            String mappingFileName;
+            String primaryKeyInJSONResponse;
             //Define the Request Specification
             RequestSpecBuilder reqBuilder = new RequestSpecBuilder().
                     setBaseUri(globalProp.getProperty("base_uri")).
@@ -207,9 +208,9 @@ public class ReusableCommonMethods {
             mappingFileName = tableProp.getProperty("asset_table_db_json_mapping_file_name");
             primaryKeyInJSONResponse = tableProp.getProperty("primary_key_in_json_response");
 
-            String filePath = System.getProperty("user.dir") + File.separator + "src" + File.separator
+            String mappingFilePath = System.getProperty("user.dir") + File.separator + "src" + File.separator
                     + "test" + File.separator + "resources" + File.separator + mappingFileName;
-            Properties mappingFileProperty = ReusableCommonMethods.getPropertiesFileObject(filePath);
+            Properties mappingFileProperty = ReusableCommonMethods.getPropertiesFileObject(mappingFilePath);
             if (mappingFileProperty == null) {
                 System.out.println("No Property file is available in the name of " +
                         "[" + mappingFileName + "] under folder DB_JSON_MAPPING");
@@ -223,7 +224,9 @@ public class ReusableCommonMethods {
             int totalPass = 0;
             int totalFail = 0;
             int recordsLeft = 0;
-            int calculatedLimit = 0;
+            int calculatedLimit;
+            HashMap<String, String> failureReport = new HashMap<>();
+            List<HashMap<String, String>> successReport = new ArrayList<>();
             for (int i = 0; i < totalIteration; i++) {
                 Response response = given(requestSpecification).proxy(globalProp.getProperty("proxy")).
                         when().param("offset", offset).param("limit", limit).
@@ -254,46 +257,168 @@ public class ReusableCommonMethods {
                     calculatedLimit = limit;
                 }
                 for (int jsonIndex = 0; jsonIndex < calculatedLimit; jsonIndex++) {
+                    StringBuilder result = new StringBuilder();
                     boolean eachJSONRecordValidationStatus = true;
                     totalRecordValidated++;
                     String primaryValue =
                             response.jsonPath().getString(("results[" + jsonIndex + "]." + primaryKeyInJSONResponse));
                     if (dataFromDatabricks.containsKey(primaryValue)) {
+                        assert mappingFileProperty != null;
                         for (String jsonKey : mappingFileProperty.stringPropertyNames()) {
                             String valueFromJSON = response.jsonPath().getString("results[" + jsonIndex + "]." + jsonKey);
                             String valueFromDB = dataFromDatabricks.get(primaryValue).get(mappingFileProperty.getProperty(jsonKey).toUpperCase());
                             if (valueFromDB.compareTo(valueFromJSON) != 0) {
-                                System.out.println("Value not matching for [" + jsonKey + "], " +
-                                        "Expected value from JSON [" + valueFromJSON + "],Actual value from DB [" + valueFromDB + "]");
+                                result.append("Value not matching for [").append(jsonKey).append("], ").append("Expected value from JSON [").append(valueFromJSON).append("],Actual value from DB [").append(valueFromDB).append("]").append("\n");
                                 overallValidationStatus = false;
                                 eachJSONRecordValidationStatus = false;
                             }
                         }
 
                     } else {
-                        System.out.println("Primary Value  [" + primaryValue + "] is not present in Databricks Database");
+                        result.append("Primary Value  [").append(primaryValue).append("] is not present in Databricks Database");
                         overallValidationStatus = false;
                         eachJSONRecordValidationStatus = false;
                     }
                     if (eachJSONRecordValidationStatus) {
                         totalPass++;
+                        successReport.add(dataFromDatabricks.get(primaryValue));
                     } else {
+                        failureReport.put(primaryValue, result.toString());
                         totalFail++;
                     }
-
                 }
                 offset = offset + limit;
                 System.out.println("Total Records Validate : [" + totalRecordValidated + "], Pass [" + totalPass + "], Fail [" + totalFail + "]");
             }
-            if (!overallValidationStatus) {
-                return false;
-            } else {
-                return true;
+            //Write the failure report in an excel
+            if (!failureReport.isEmpty()) {
+                writeFailureReport(failureReport, globalProp.getProperty("reportPath"), validationTableName);
             }
+            //Write the Success report in an excel
+            if (!successReport.isEmpty()) {
+                writeSuccessfulReport(mappingFilePath, globalProp.getProperty("reportPath"), validationTableName, successReport);
+            }
+
+            return overallValidationStatus;
 
         } catch (Exception e) {
             System.out.println("Exception Occurred while validating value between DB and JSON : " + e);
             return false;
+        }
+    }
+
+    public static void writeFailureReport(HashMap<String, String> failureReport, String filePath, String validationTableName) {
+        filePath = System.getProperty("user.dir") + File.separator + "src" + File.separator + "test" + File.separator + filePath;
+        String[] arr = validationTableName.split("\\.");
+        filePath = filePath + File.separator + arr[0] + File.separator + "FailureReport_" + getCurrentDateAndTime() + ".xlsx";
+        System.out.println("Failure Report Path : " + failureReport);
+        Workbook workbook = new XSSFWorkbook();
+        // Create a sheet
+        Sheet sheet = workbook.createSheet("FailureReport");
+        Row row = sheet.createRow(0);
+        row.createCell(0).setCellValue("Primary Key");
+        row.createCell(1).setCellValue("Failure Description");
+        int rowNum = 1;
+        for (String primaryValue : failureReport.keySet()) {
+            row = sheet.createRow(rowNum);
+            row.createCell(0).setCellValue(primaryValue);
+            row.createCell(1).setCellValue(failureReport.get(primaryValue));
+
+        }
+        // Save the Excel file
+        try (FileOutputStream fileOut = new FileOutputStream(filePath)) {
+            workbook.write(fileOut);
+            System.out.println("Failure Report generated successfully: " + filePath);
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                workbook.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public static String getCurrentDateAndTime() {
+        // Define the format
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("ddMMyyyy_HHmmss");
+        // Get the current date and time
+        // Print the formatted date and time
+        return LocalDateTime.now().format(formatter);
+    }
+
+    public static void writeSuccessfulReport(String mappingFilePath, String reportPath,
+                                             String validationTableName, List<HashMap<String, String>> successReport) {
+        try {
+            List<String> reportOrder = getPropertiesFileValueInListWithOrder(mappingFilePath);
+            reportPath = System.getProperty("user.dir") + File.separator + "src" + File.separator + "test" + File.separator + reportPath;
+            String[] arr = validationTableName.split("\\.");
+            reportPath = reportPath + File.separator + arr[0] + File.separator + "SuccessReport_" + getCurrentDateAndTime() + ".xlsx";
+            System.out.println("Success Report Path : " + reportPath);
+            Workbook workbook = new XSSFWorkbook();
+            // Create a sheet
+            Sheet sheet = workbook.createSheet("SuccessReport");
+            Row row = sheet.createRow(0);
+            //Set the header
+            for (int i = 0; i < reportOrder.size(); i++) {
+                Cell cell = row.createCell(i);
+                cell.setCellValue(reportOrder.get(i).toUpperCase());
+                CellStyle style = workbook.createCellStyle();
+                Font font = workbook.createFont();
+                font.setBold(true);
+                style.setFont(font);
+                cell.setCellStyle(style);
+            }
+            //Set the value of all the records
+            for (int excelRow = 1; excelRow <= successReport.size(); excelRow++) {
+                row = sheet.createRow(excelRow);
+                for (int excelCell = 0; excelCell < reportOrder.size(); excelCell++) {
+                    Cell cell = row.createCell(excelCell);
+                    cell.setCellValue(successReport.get((excelRow - 1)).get(reportOrder.get(excelCell)));
+                }
+            }
+            // Save the Excel file
+            try (FileOutputStream fileOut = new FileOutputStream(reportPath)) {
+                workbook.write(fileOut);
+                System.out.println("Success Report generated successfully: " + reportPath);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    workbook.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("Exception Occurred while generating success report : " + e);
+        }
+
+    }
+
+    public static List<String> getPropertiesFileValueInListWithOrder(String mappingFilePath) {
+        List<String> reportOrder = new ArrayList<>();
+        try {
+            LinkedHashMap<String, String> orderedProperties = new LinkedHashMap<>();
+            // Read file manually
+            BufferedReader reader = new BufferedReader(new FileReader(mappingFilePath));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.contains("=")) { // Ignore empty lines
+                    String[] parts = line.split("=", 2);
+                    orderedProperties.put(parts[0].trim(), parts[1].trim());
+                }
+            }
+            reader.close();
+            // Printing keys in original order
+            for (Map.Entry<String, String> entry : orderedProperties.entrySet()) {
+                reportOrder.add(entry.getValue().toUpperCase());
+            }
+            return reportOrder;
+        } catch (Exception e) {
+            System.out.println("Exception occurred while fetching the order of report : " + e);
+            return reportOrder;
         }
     }
 }
