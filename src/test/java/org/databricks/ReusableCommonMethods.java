@@ -1,5 +1,7 @@
 package org.databricks;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.restassured.builder.RequestSpecBuilder;
 import io.restassured.builder.ResponseSpecBuilder;
 import io.restassured.filter.log.LogDetail;
@@ -419,6 +421,155 @@ public class ReusableCommonMethods {
         } catch (Exception e) {
             System.out.println("Exception occurred while fetching the order of report : " + e);
             return reportOrder;
+        }
+    }
+
+    public static boolean performComparisonBetweenDBAndAPIUsingJackson
+            (Properties globalProp, Properties tableProp, String accessToken, int expectedTotalRecordsToValidate,
+             HashMap<String, HashMap<String, String>> dataFromDatabricks, String validationTableName) {
+        try {
+            String endPoint;
+            String mappingFileName;
+            String primaryKeyInJSONResponse;
+            //Define the Request Specification
+            RequestSpecBuilder reqBuilder = new RequestSpecBuilder().
+                    setBaseUri(globalProp.getProperty("base_uri")).
+                    setBasePath(globalProp.getProperty("base_path")).
+                    addHeader("Authorization", "Bearer " + accessToken).
+                    addHeader("Accept", "application/json").
+                    addHeader("Content-Type", "application/json").
+                    setContentType(ContentType.JSON).
+                    log(LogDetail.URI);
+            RequestSpecification requestSpecification = reqBuilder.build();
+
+            //Define the Response Specification
+            ResponseSpecBuilder resBuilder = new ResponseSpecBuilder()
+                    .log(LogDetail.STATUS);
+            ResponseSpecification responseSpecification = resBuilder.build();
+
+
+            endPoint = tableProp.getProperty("asset_table_end_point");
+            mappingFileName = tableProp.getProperty("asset_table_db_json_mapping_file_name");
+            primaryKeyInJSONResponse = tableProp.getProperty("primary_key_in_json_response");
+
+            String mappingFilePath = System.getProperty("user.dir") + File.separator + "src" + File.separator
+                    + "test" + File.separator + "resources" + File.separator + mappingFileName;
+            Properties mappingFileProperty = ReusableCommonMethods.getPropertiesFileObject(mappingFilePath);
+            if (mappingFileProperty == null) {
+                System.out.println("No Property file is available in the name of " +
+                        "[" + mappingFileName + "] under folder DB_JSON_MAPPING");
+                System.exit(0);
+            }
+
+            int totalIteration = 1;
+            int offset = 0;
+            int limit = 1000;
+            boolean overallValidationStatus = true;
+            int totalRecordValidated = 0;
+            int totalPass = 0;
+            int totalFail = 0;
+            HashMap<String, String> failureReport = new HashMap<>();
+            List<HashMap<String, String>> successReport = new ArrayList<>();
+            for (int i = 0; i < totalIteration; i++) {
+                Response response = given(requestSpecification).proxy(globalProp.getProperty("proxy")).
+                        when().param("offset", offset).param("limit", limit).
+                        get(endPoint).
+                        then().spec(responseSpecification).
+                        assertThat().
+                        statusCode(200).extract().response();
+                // Convert response to JsonNode
+                ObjectMapper objectMapper = new ObjectMapper();
+                JsonNode rootNode = objectMapper.readTree(response.asString());
+                //Add code to calculate the total iteration
+                if (i == 0) {
+                    //If all the records to be validated
+                    if (expectedTotalRecordsToValidate < 0) {
+                        int totalRecordInScope = rootNode.get("total").asInt();
+                        totalIteration = totalRecordInScope / limit + 1;
+                    } else {
+                        //if total records to be validated is not full set and user has provided input
+                        if (expectedTotalRecordsToValidate % limit != 0) {
+                            totalIteration = expectedTotalRecordsToValidate / limit + 1;
+                        } else {
+                            totalIteration = expectedTotalRecordsToValidate / limit;
+                        }
+                    }
+                }
+
+                for (JsonNode result : rootNode.get("results")) {
+                    totalRecordValidated++;
+                    boolean eachJSONRecordValidationStatus = true;
+                    StringBuilder validationResultMessage = new StringBuilder();
+                    String primaryValue = getValueFromJSON(result, primaryKeyInJSONResponse);
+                    if (dataFromDatabricks.containsKey(primaryValue)) {
+                        for (String jsonKey : mappingFileProperty.stringPropertyNames()) {
+                            String valueFromJSON = getValueFromJSON(result, jsonKey);
+                            String valueFromDB = dataFromDatabricks.get(primaryValue).get(mappingFileProperty.getProperty(jsonKey).toUpperCase());
+                            if (valueFromDB.compareTo(valueFromJSON) != 0) {
+                                validationResultMessage.append("Value not matching for [").append(jsonKey).append("], ").append("Expected value from JSON [").append(valueFromJSON).append("],Actual value from DB [").append(valueFromDB).append("]").append("\n");
+                                overallValidationStatus = false;
+                                eachJSONRecordValidationStatus = false;
+                            }
+                        }
+                    } else {
+                        validationResultMessage.append("Primary Value  [").append(primaryValue).append("] is not present in Databricks Database");
+                        overallValidationStatus = false;
+                        eachJSONRecordValidationStatus = false;
+                    }
+                    if (eachJSONRecordValidationStatus) {
+                        totalPass++;
+                        successReport.add(dataFromDatabricks.get(primaryValue));
+                    } else {
+                        failureReport.put(primaryValue, result.toString());
+                        totalFail++;
+                    }
+                    if (totalRecordValidated % 100 == 0) {
+                        System.out.println("Total API Records Validated so far : " + totalRecordValidated);
+                    }
+                }
+                offset = offset + limit;
+                System.out.println("Total Records Validate : [" + totalRecordValidated + "], Pass [" + totalPass + "], Fail [" + totalFail + "]");
+
+            }
+
+            //Write the failure report in an excel
+            if (!failureReport.isEmpty()) {
+                writeFailureReport(failureReport, globalProp.getProperty("reportPath"), validationTableName);
+            }
+            //Write the Success report in an excel
+            if (!successReport.isEmpty()) {
+                writeSuccessfulReport(mappingFilePath, globalProp.getProperty("reportPath"), validationTableName, successReport);
+            }
+            return overallValidationStatus;
+
+        } catch (Exception e) {
+            System.out.println("Exception Occurred while validating value between DB and JSON : " + e);
+            return false;
+        }
+    }
+
+    public static String getValueFromJSON(JsonNode node, String jsonKey) {
+        try {
+            if (jsonKey.contains(".")) {
+                String[] arr = jsonKey.split("\\.");
+                switch (arr.length) {
+                    case 2:
+                        return node.get(arr[0]).get(arr[1]).asText();
+                    case 3:
+                        return node.get(arr[0]).get(arr[1]).get(arr[2]).asText();
+                    case 4:
+                        return node.get(arr[0]).get(arr[1]).get(arr[2]).get(arr[3]).asText();
+                    default:
+                        System.out.println("Given JSON Path in the properties file is not supported");
+                        return null;
+                }
+            } else {
+                return node.get(jsonKey).asText();
+            }
+
+        } catch (Exception e) {
+            System.out.println("Exception Occurred while getting the JSON Value : " + e);
+            return null;
         }
     }
 }

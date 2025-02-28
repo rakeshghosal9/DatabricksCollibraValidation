@@ -42,7 +42,7 @@ public class DatabricksCollibraValidation {
 
         //Perform the comparison
         boolean overallValidation =
-                ReusableCommonMethods.performComparisonBetweenDBAndAPI
+                ReusableCommonMethods.performComparisonBetweenDBAndAPIUsingJackson
                         (globalProp, tableProp, accessToken, totalRecordsWishToValidate, dataFromDatabricks, validationTableName);
         if (!overallValidation) {
             System.out.println("Overall validation failed, please check logs for more details");
